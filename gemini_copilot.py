@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Gemini Blender Copilot",
     "author": "AI Assistant",
-    "version": (2, 4),
+    "version": (2, 5),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Gemini Copilot",
-    "description": "透過 Gemini API 自動生成並執行 Blender Python 腳本 (支援 Blender 5.x 智慧 API 向下相容、自動視圖置中對焦、Undo 復原與防爆快取)",
+    "description": "透過 Gemini API 自動生成並執行 Blender Python 腳本 (支援思考標籤過濾、語法先行檢驗、常用模組自動注入、503 自動容災與 Undo 復原)",
     "category": "Development",
 }
 
@@ -15,6 +15,11 @@ import json
 import re
 import time
 import threading
+import ast
+import math
+import bmesh
+import mathutils
+import random
 
 addon_name = __package__ if __package__ else (__name__ if __name__ != "__main__" else "gemini_blender_copilot")
 
@@ -33,24 +38,24 @@ SYSTEM_INSTRUCTION = (
     "You are an expert Blender 5.x Python developer.\n"
     "Your goal is to write high-quality, clean, valid, and executable Blender Python code based on the user's prompt.\n\n"
     "CRITICAL RULES:\n"
-    "1. OUTPUT ONLY EXECUTABLE PYTHON CODE wrapped inside markdown backticks: ```python ... ```. Do NOT write any conversational text or notes outside.\n"
-    "2. CREATE ONLY THE REQUESTED OBJECT(S): If the user asks for 'a pyramid' (金字塔), create ONLY the pyramid. "
+    "1. OUTPUT ONLY EXECUTABLE PYTHON CODE wrapped inside markdown backticks: ```python ... ```. "
+    "Do NOT output any conversational text, thoughts, reasoning steps, or notes outside the markdown code block.\n"
+    "2. CREATE ONLY THE REQUESTED OBJECT(S): If the user asks for 'a Boeing 747' (波音747) or 'a pyramid' (金字塔), create ONLY that object. "
     "NEVER create giant ground planes, desert floors, landscapes, terrain planes, extra cameras, or studio backdrops unless the user explicitly requested them.\n"
     "3. NEVER DELETE EXISTING SCENE OBJECTS: Do NOT call bpy.ops.object.delete() or select_all(action='SELECT'). Always add objects directly to the existing scene.\n"
-    "4. STANDARD SCALE & PLACEMENT: Place the object centered at (0, 0, 0) or standing upright on the ground plane (z >= 0) with a standard visible size (height/radius around 2 to 4 units).\n"
-    "5. USE DIRECT BLENDER APIS: For a pyramid, use `bpy.ops.mesh.primitive_cone_add(vertices=4, radius1=2.0, depth=2.5, location=(0.0, 0.0, 1.25))` "
-    "or build cleanly with bmesh. Assign a clean, visible material with an appropriate color.\n"
-    "6. ACTIVE SELECTION: Ensure the newly created object is selected and set as the active object:\n"
+    "4. STANDARD SCALE & PLACEMENT: Place the object centered at (0, 0, 0) or standing upright on the ground plane (z >= 0) with a standard visible size (length/height around 2 to 6 units).\n"
+    "5. ACTIVE SELECTION: Ensure the newly created object is selected and set as the active object:\n"
     "   obj.select_set(True)\n"
     "   bpy.context.view_layer.objects.active = obj\n"
-    "7. BLENDER 5.x COLLECTION API (CRITICAL): If using bpy.data.objects.new(), pass object_data positionally or with object_data= (NOT mesh=), "
+    "6. BLENDER 5.x COLLECTION API (CRITICAL): If using bpy.data.objects.new(), pass object_data positionally or with object_data= (NOT mesh=), "
     "and link objects using `bpy.context.collection.objects.link(obj)`. NEVER use obsolete 2.7x APIs like `bpy.context.scene.objects.link(obj)`.\n"
+    "7. COMPLETE CODE: Ensure all functions defined in the script are invoked at the end of the script."
 )
 
 # 支援的 Google AI Studio 最新標準模型清單
 AVAILABLE_MODELS = [
     ('gemini-3.6-flash', 'Gemini 3.6 Flash (官方主力推薦，最快最強)', 'Google 官方推薦最新主力模型，速度極快、代碼品質頂尖且支援免費層'),
-    ('gemini-3.5-flash-lite', 'Gemini 3.5 Flash-Lite (極速，最省額度)', '超低延遲且資源佔用最低，最省配額'),
+    ('gemini-3.5-flash-lite', 'Gemini 3.5 Flash-Lite (極速，最省額度)', '超低延遲且資源佔用最低，最省配額且極穩定'),
     ('gemini-flash-latest', 'Gemini Flash Latest (最新 Flash 自動對齊)', '自動對齊 Google 最新發布之 Flash 模型版本'),
     ('gemini-flash-lite-latest', 'Gemini Flash-Lite Latest (最新輕量版)', '自動對齊 Google 最新發布之輕量 Flash 模型'),
     ('gemini-3.1-flash-lite', 'Gemini 3.1 Flash-Lite (輕量穩定)', '穩定的輕量化代碼生成模型'),
@@ -215,6 +220,55 @@ def install_compatibility_polyfills():
         if hasattr(bpy.types, 'Collection'):
             bpy.types.Collection.link = col_link
             bpy.types.Collection.unlink = col_unlink
+
+        # BMesh 常用算子相容補丁 (消除 AI 呼叫 create_cylinder / create_sphere / create_plane 引起的算子不存在報錯)
+        if hasattr(bmesh, 'ops'):
+            if not hasattr(bmesh.ops, 'create_cylinder'):
+                def bmesh_create_cylinder(bm, **kwargs):
+                    r = kwargs.pop('radius', kwargs.pop('radius1', 1.0))
+                    r1 = kwargs.pop('radius1', r)
+                    r2 = kwargs.pop('radius2', r)
+                    depth = kwargs.pop('depth', 2.0)
+                    cap_ends = kwargs.pop('cap_ends', True)
+                    segments = kwargs.pop('segments', 32)
+                    return bmesh.ops.create_cone(
+                        bm,
+                        cap_ends=cap_ends,
+                        segments=segments,
+                        radius1=r1,
+                        radius2=r2,
+                        depth=depth,
+                        **kwargs
+                    )
+                setattr(bmesh.ops, 'create_cylinder', bmesh_create_cylinder)
+
+            if not hasattr(bmesh.ops, 'create_sphere'):
+                def bmesh_create_sphere(bm, **kwargs):
+                    r = kwargs.pop('radius', 1.0)
+                    u_segments = kwargs.pop('u_segments', kwargs.pop('segments', 32))
+                    v_segments = kwargs.pop('v_segments', kwargs.pop('ring_count', 16))
+                    return bmesh.ops.create_uvsphere(
+                        bm,
+                        u_segments=u_segments,
+                        v_segments=v_segments,
+                        radius=r,
+                        **kwargs
+                    )
+                setattr(bmesh.ops, 'create_sphere', bmesh_create_sphere)
+
+            if not hasattr(bmesh.ops, 'create_plane'):
+                def bmesh_create_plane(bm, **kwargs):
+                    size = kwargs.pop('size', 2.0)
+                    x_segments = kwargs.pop('x_segments', 1)
+                    y_segments = kwargs.pop('y_segments', 1)
+                    return bmesh.ops.create_grid(
+                        bm,
+                        x_segments=x_segments,
+                        y_segments=y_segments,
+                        size=size,
+                        **kwargs
+                    )
+                setattr(bmesh.ops, 'create_plane', bmesh_create_plane)
     except Exception as e:
         print("[Gemini Copilot] Polyfill warning:", e)
 
@@ -243,7 +297,7 @@ def sanitize_code_for_blender5(code):
 
 
 def extract_python_code(text):
-    """強健提取 Python 代碼，徹底移除 Markdown 標記與外部說明文字"""
+    """強健提取 Python 代碼，徹底移除 Markdown 標記與外部思考/說明文字"""
     text = text.strip()
     if not text:
         return ""
@@ -259,9 +313,19 @@ def extract_python_code(text):
             cleaned = m.group(1).strip()
             extracted = re.sub(r"```+$", "", cleaned).strip()
         else:
-            # 3. 備用過濾：去除可能存在的各類行首 backticks
-            lines = [l for l in text.splitlines() if not l.strip().startswith("```")]
-            extracted = "\n".join(lines).strip()
+            # 3. 備用過濾：如果沒有 markdown 標籤，僅提取包含 Python 關鍵字的區塊
+            lines = text.splitlines()
+            code_lines = []
+            in_code = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("```"):
+                    continue
+                if stripped.startswith("import ") or stripped.startswith("def ") or stripped.startswith("bpy.") or stripped.startswith("from "):
+                    in_code = True
+                if in_code:
+                    code_lines.append(line)
+            extracted = "\n".join(code_lines).strip() if code_lines else "\n".join(lines).strip()
 
     return sanitize_code_for_blender5(extracted)
 
@@ -350,7 +414,7 @@ class GeminiCopilotSettings(bpy.types.PropertyGroup):
     prompt: bpy.props.StringProperty(
         name="提示詞",
         description="你想讓 AI 建立什麼？",
-        default="建立一個金字塔"
+        default="建立一個波音747"
     )
     status: bpy.props.StringProperty(
         name="狀態",
@@ -405,10 +469,19 @@ def execute_generated_code(code, report_func=None):
     """執行生成的 Python 腳本，自動選取新物件、對焦 3D 視圖並推入 Undo 復原點"""
     clean_code = extract_python_code(code)
     if not clean_code:
-        msg = "程式碼內容為空"
+        msg = "未能獲取有效的 Python 程式碼"
         if report_func:
             report_func({'ERROR'}, msg)
         return False, msg, []
+
+    # 語法先行驗證，防止非 Python 思考字串或未閉合字串進入 exec
+    try:
+        ast.parse(clean_code)
+    except SyntaxError as syn_err:
+        err_msg = f"代碼語法錯誤 (第 {syn_err.lineno} 行): {syn_err.msg}"
+        if report_func:
+            report_func({'ERROR'}, err_msg)
+        return False, err_msg, []
 
     # 確保相容性 polyfill 處於啟用狀態
     install_compatibility_polyfills()
@@ -426,11 +499,35 @@ def execute_generated_code(code, report_func=None):
 
         # 推入 Undo 復原點：按下 Ctrl+Z 即可完美復原
         bpy.ops.ed.undo_push(message="Gemini Script Execution")
-        global_dict = {"bpy": bpy, "__builtins__": __builtins__}
+        
+        # 預先注入常用 Blender 模組，杜絕 NameError: name 'mathutils' is not defined
+        global_dict = {
+            "bpy": bpy,
+            "math": math,
+            "bmesh": bmesh,
+            "mathutils": mathutils,
+            "random": random,
+            "__builtins__": __builtins__,
+        }
         exec(clean_code, global_dict)
 
         # 檢測新建立的物件
         new_objects = [o for o in bpy.data.objects if o not in existing_objects]
+
+        # 若未檢測到新物件，檢查腳本是否定義了建構函數但忘記在末端呼叫 (例如 def create_boeing_747() 或 main())
+        if not new_objects:
+            candidate_funcs = [
+                v for k, v in global_dict.items()
+                if callable(v) and (k.startswith("create_") or k.startswith("build_") or k.startswith("make_") or k in ("main", "generate", "run"))
+            ]
+            for func in candidate_funcs:
+                try:
+                    func()
+                    new_objects = [o for o in bpy.data.objects if o not in existing_objects]
+                    if new_objects:
+                        break
+                except Exception as fe:
+                    print(f"[Gemini Copilot] 自動補呼叫函數 {getattr(func, '__name__', str(func))} 失敗: {fe}")
 
         # 確保新物件已正確鏈結至場景集合且處於可見狀態
         for obj in new_objects:
@@ -503,7 +600,7 @@ class OBJECT_OT_gemini_test_connection(bpy.types.Operator):
         }
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "Blender-Gemini-Copilot/2.4",
+            "User-Agent": "Blender-Gemini-Copilot/2.5",
         }
         req = urllib.request.Request(test_url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
 
@@ -527,7 +624,7 @@ class OBJECT_OT_gemini_test_connection(bpy.types.Operator):
             elif http_err.code in (400, 401, 403):
                 msg = f"API Key 認證失敗 ({http_err.code}): 請檢查 Key 是否正確"
             elif http_err.code == 503:
-                msg = f"模型 [{model_id}] 伺服器繁忙 (503)，請稍候再試"
+                msg = f"模型 [{model_id}] 伺服器繁忙 (503)，請稍候再試或切換至 gemini-3.5-flash-lite"
             else:
                 msg = f"HTTP 錯誤 ({http_err.code}): {err_detail}"
 
@@ -631,84 +728,118 @@ class OBJECT_OT_gemini_clear_cache(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# 8. 背景非同步核心生成 Operator
-def _async_gemini_worker(api_key, model_id, max_tokens, temperature, prompt):
-    """背景線程工作函式：負責發送 HTTP 請求與代碼解析"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens
-        }
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Blender-Gemini-Copilot/2.4",
-    }
+# 8. 背景非同步核心生成 Operator (支援 503 自動降級容災)
+def _async_gemini_worker(api_key, primary_model_id, max_tokens, temperature, prompt):
+    """背景線程工作函式：負責發送 HTTP 請求、過濾思考字串、代碼解析與 429/503 自動備援容災"""
+    models_to_try = [primary_model_id]
+    if primary_model_id != 'gemini-3.5-flash-lite':
+        models_to_try.append('gemini-3.5-flash-lite')
+    if primary_model_id != 'gemini-3.6-flash' and 'gemini-3.6-flash' not in models_to_try:
+        models_to_try.append('gemini-3.6-flash')
 
-    try:
-        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
-        with urllib.request.urlopen(req, timeout=40) as response:
-            res_body = response.read().decode('utf-8')
-            res_data = json.loads(res_body)
-
-            if 'candidates' not in res_data or not res_data['candidates']:
-                if 'error' in res_data:
-                    err_msg = res_data['error'].get('message', '未知 API 錯誤')
-                    _request_state["result"] = {"success": False, "error": f"API 錯誤: {err_msg}"}
-                else:
-                    _request_state["result"] = {"success": False, "error": "伺服器未回傳有效候選結果"}
-                return
-
-            candidate = res_data['candidates'][0]
-            finish_reason = candidate.get('finishReason', 'STOP')
-
-            if finish_reason not in ('STOP', 'MAX_TOKENS'):
-                _request_state["result"] = {"success": False, "error": f"生成受阻: 原因代碼 {finish_reason}"}
-                return
-
-            parts = candidate.get('content', {}).get('parts', [])
-            text_response = ''.join(p.get('text', '') for p in parts if 'text' in p).strip()
-
-            if not text_response:
-                _request_state["result"] = {"success": False, "error": f"回傳資料缺少文字內容 (結束原因: {finish_reason})"}
-                return
-
-            clean_code = extract_python_code(text_response)
-            if not clean_code:
-                _request_state["result"] = {"success": False, "error": "未能自回傳內容中解析出有效的 Python 程式碼"}
-                return
-
-            _request_state["result"] = {
-                "success": True,
-                "code": clean_code,
-                "truncated": finish_reason == 'MAX_TOKENS'
+    for attempt, current_model in enumerate(models_to_try):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{current_model}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens
             }
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Blender-Gemini-Copilot/2.5",
+        }
 
-    except urllib.error.HTTPError as http_err:
         try:
-            err_body = http_err.read().decode('utf-8')
-            err_json = json.loads(err_body)
-            err_msg = err_json.get('error', {}).get('message', str(http_err))
-        except:
-            err_msg = str(http_err)
+            req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+            with urllib.request.urlopen(req, timeout=50) as response:
+                res_body = response.read().decode('utf-8')
+                res_data = json.loads(res_body)
 
-        if http_err.code == 404:
-            reason = f"找不到模型 [{model_id}]。推薦改用 gemini-3.6-flash"
-        elif http_err.code == 429:
-            reason = f"模型 [{model_id}] 請求頻率過高 (429)。請稍候 15 秒再試或切換至 gemini-3.5-flash-lite"
-        elif http_err.code in (400, 401, 403):
-            reason = f"API Key 錯誤 ({http_err.code}): {err_msg}"
-        elif http_err.code == 503:
-            reason = f"伺服器繁忙 (503)，請稍後再試或使用 gemini-3.5-flash-lite"
-        else:
-            reason = f"HTTP {http_err.code}: {err_msg}"
+                if 'candidates' not in res_data or not res_data['candidates']:
+                    if 'error' in res_data:
+                        err_msg = res_data['error'].get('message', '未知 API 錯誤')
+                        _request_state["result"] = {"success": False, "error": f"API 錯誤: {err_msg}"}
+                    else:
+                        _request_state["result"] = {"success": False, "error": "伺服器未回傳有效候選結果"}
+                    return
 
-        _request_state["result"] = {"success": False, "error": reason}
-    except Exception as e:
-        _request_state["result"] = {"success": False, "error": f"網路異常: {str(e)}"}
+                candidate = res_data['candidates'][0]
+                finish_reason = candidate.get('finishReason', 'STOP')
+
+                if finish_reason not in ('STOP', 'MAX_TOKENS'):
+                    _request_state["result"] = {"success": False, "error": f"生成受阻: 原因代碼 {finish_reason}"}
+                    return
+
+                parts = candidate.get('content', {}).get('parts', [])
+                
+                # 【核心過濾】：僅選取非思考過程 (thought=False) 的正式回傳，杜絕思考草稿干擾
+                content_parts = [p for p in parts if not p.get('thought', False) and 'text' in p]
+                
+                if not content_parts:
+                    # 若所有 parts 均為思考標籤，表示在思考階段即達上限或被中斷
+                    _request_state["result"] = {
+                        "success": False,
+                        "error": "AI 推理超時或達上限，未能產出正式代碼 (請重新發送或改用 Flash-Lite 模型)"
+                    }
+                    return
+
+                text_response = ''.join(p.get('text', '') for p in content_parts).strip()
+
+                if not text_response:
+                    _request_state["result"] = {"success": False, "error": f"回傳資料缺少文字內容 (結束原因: {finish_reason})"}
+                    return
+
+                clean_code = extract_python_code(text_response)
+                if not clean_code:
+                    _request_state["result"] = {"success": False, "error": "未能自回傳內容中解析出有效的 Python 程式碼"}
+                    return
+
+                _request_state["result"] = {
+                    "success": True,
+                    "code": clean_code,
+                    "truncated": finish_reason == 'MAX_TOKENS',
+                    "model_used": current_model,
+                }
+                return
+
+        except urllib.error.HTTPError as http_err:
+            try:
+                err_body = http_err.read().decode('utf-8')
+                err_json = json.loads(err_body)
+                err_msg = err_json.get('error', {}).get('message', str(http_err))
+            except:
+                err_msg = str(http_err)
+
+            # 若 503 (伺服器繁忙) 或 429 (請求頻率/配額受限) 且還有備選模型，自動嘗試備援模型
+            if http_err.code in (429, 503) and attempt < len(models_to_try) - 1:
+                next_model = models_to_try[attempt + 1]
+                print(f"[Gemini Copilot] 模型 {current_model} 遇 HTTP {http_err.code}，自動切換至備援模型: {next_model}")
+                time.sleep(0.5)
+                continue
+
+            if http_err.code == 404:
+                reason = f"找不到模型 [{current_model}]。推薦改用 gemini-3.6-flash"
+            elif http_err.code == 429:
+                reason = f"模型 [{current_model}] 請求頻率過高 (429)。請稍候 15 秒再試或切換至 gemini-3.5-flash-lite"
+            elif http_err.code in (400, 401, 403):
+                reason = f"API Key 錯誤 ({http_err.code}): {err_msg}"
+            elif http_err.code == 503:
+                reason = f"伺服器繁忙 (503)，請稍後再試或使用 gemini-3.5-flash-lite"
+            else:
+                reason = f"HTTP {http_err.code}: {err_msg}"
+
+            _request_state["result"] = {"success": False, "error": reason}
+            return
+
+        except Exception as e:
+            if attempt < len(models_to_try) - 1:
+                time.sleep(0.5)
+                continue
+            _request_state["result"] = {"success": False, "error": f"網路異常: {str(e)}"}
+            return
 
 
 def _gemini_poll_timer():
@@ -831,7 +962,7 @@ class OBJECT_OT_gemini_run(bpy.types.Operator):
 
 # 9. 現代化 UI 面板
 class VIEW3D_PT_gemini_copilot(bpy.types.Panel):
-    bl_label = "Gemini Copilot v2.4"
+    bl_label = "Gemini Copilot v2.5"
     bl_idname = "VIEW3D_PT_gemini_copilot"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'

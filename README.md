@@ -13,8 +13,14 @@
 
 - ⚡ **非同步背景生成（零卡頓）**  
   採用 `threading.Thread` + `bpy.app.timers` 非同步架構，向 Gemini API 發送請求時不會凍結 Blender 視窗，UI 操作依然絲滑順暢。
+- 🧠 **Gemini 3.x 思考過程草稿智慧過濾 (Thought Filter & AST Validation)**  
+  針對 Google 最新一代具備推理能力之模型（如 Gemini 3.x Flash），強制過濾內部思考草稿標籤（`thought: True`），搭配 `ast.parse` 語法預驗證，杜絕未閉合字串或思考筆記外洩污染代碼。
 - 🛡️ **Blender 5.x 專屬相容性補丁 (Polyfills & Auto-Sanitizer)**  
-  徹底解決大語言模型常見的舊版 API 幻覺！內建動態相容 Polyfill，並自動將舊語法（例如 `scene.objects.link` 自動升級為 `context.collection.objects.link`、`bpy.data.objects.new` 的 `mesh=` 修正為 `object_data=`）。
+  徹底解決大語言模型常見的舊版 API 幻覺！內建動態相容 Polyfill（包含 `scene.objects.link` 自動轉接、BMesh 算子如 `create_cylinder` / `create_sphere` / `create_plane` 自動映射），並自動將舊語法修正為 5.x 標準。
+- 🔄 **429 / 503 自動備援降級容災 (Auto-Failover Resilience)**  
+  當主力模型遇到 Google API 速率限制（429）或伺服器負載過高（503）時，外掛自動無縫切換至備援模型（如 `gemini-3.5-flash-lite`），確保創作流程永不中斷。
+- 🛠️ **未呼叫建構函數自動補呼 (Auto-Invocation)**  
+  若 AI 定義了 `def create_*()` 或 `def main()` 卻忘記在代碼結尾執行，外掛會自動偵測並補呼叫，確保模型 100% 成功生成於場景中。
 - 🎯 **純淨物件建模守則 (Pure Object Generation)**  
   專屬系統提示約束，嚴格禁止 AI 擅自清空場景（`bpy.ops.object.delete()`）或隨意加入巨型底板、多餘燈光，只精準生成您指定的物件。
 - 🎥 **自動置中對焦與選取 (Auto Focus & Selection)**  
