@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Gemini Blender Copilot",
     "author": "AI Assistant",
-    "version": (2, 5),
+    "version": (2, 6),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Gemini Copilot",
     "description": "透過 Gemini API 自動生成並執行 Blender Python 腳本 (支援思考標籤過濾、語法先行檢驗、常用模組自動注入、503 自動容災與 Undo 復原)",
@@ -52,10 +52,10 @@ SYSTEM_INSTRUCTION = (
     "7. COMPLETE CODE: Ensure all functions defined in the script are invoked at the end of the script."
 )
 
-# 支援的 Google AI Studio 最新標準模型清單
+# 支援的 Google AI Studio 最新標準模型清單 (推薦 Flash-Lite 極速省額度且無推理卡頓)
 AVAILABLE_MODELS = [
-    ('gemini-3.6-flash', 'Gemini 3.6 Flash (官方主力推薦，最快最強)', 'Google 官方推薦最新主力模型，速度極快、代碼品質頂尖且支援免費層'),
-    ('gemini-3.5-flash-lite', 'Gemini 3.5 Flash-Lite (極速，最省額度)', '超低延遲且資源佔用最低，最省配額且極穩定'),
+    ('gemini-3.5-flash-lite', 'Gemini 3.5 Flash-Lite (極速推薦，最穩最省)', '超低延遲且無推理超時，代碼生成極快且不易受配額限制'),
+    ('gemini-3.6-flash', 'Gemini 3.6 Flash (官方主力，推理強大)', 'Google 官方最新主力模型，推理能力強但耗時較長'),
     ('gemini-flash-latest', 'Gemini Flash Latest (最新 Flash 自動對齊)', '自動對齊 Google 最新發布之 Flash 模型版本'),
     ('gemini-flash-lite-latest', 'Gemini Flash-Lite Latest (最新輕量版)', '自動對齊 Google 最新發布之輕量 Flash 模型'),
     ('gemini-3.1-flash-lite', 'Gemini 3.1 Flash-Lite (輕量穩定)', '穩定的輕量化代碼生成模型'),
@@ -223,15 +223,41 @@ def install_compatibility_polyfills():
 
         # BMesh 常用算子相容補丁 (消除 AI 呼叫 create_cylinder / create_sphere / create_plane 引起的算子不存在報錯)
         if hasattr(bmesh, 'ops'):
+            # 包裝 create_cone：自動修正 AI 誤傳的 vertices / radius / height 參數
+            orig_create_cone = bmesh.ops.create_cone
+            def safe_create_cone(bm, **kwargs):
+                if 'vertices' in kwargs and 'segments' not in kwargs:
+                    kwargs['segments'] = kwargs.pop('vertices')
+                if 'radius' in kwargs:
+                    r = kwargs.pop('radius')
+                    kwargs.setdefault('radius1', r)
+                    kwargs.setdefault('radius2', r)
+                if 'height' in kwargs and 'depth' not in kwargs:
+                    kwargs['depth'] = kwargs.pop('height')
+                if 'length' in kwargs and 'depth' not in kwargs:
+                    kwargs['depth'] = kwargs.pop('length')
+                return orig_create_cone(bm, **kwargs)
+            setattr(bmesh.ops, 'create_cone', safe_create_cone)
+
+            # 包裝 create_uvsphere：自動修正 segments / ring_count 參數
+            orig_create_uvsphere = bmesh.ops.create_uvsphere
+            def safe_create_uvsphere(bm, **kwargs):
+                if 'segments' in kwargs and 'u_segments' not in kwargs:
+                    kwargs['u_segments'] = kwargs.pop('segments')
+                if 'ring_count' in kwargs and 'v_segments' not in kwargs:
+                    kwargs['v_segments'] = kwargs.pop('ring_count')
+                return orig_create_uvsphere(bm, **kwargs)
+            setattr(bmesh.ops, 'create_uvsphere', safe_create_uvsphere)
+
             if not hasattr(bmesh.ops, 'create_cylinder'):
                 def bmesh_create_cylinder(bm, **kwargs):
                     r = kwargs.pop('radius', kwargs.pop('radius1', 1.0))
                     r1 = kwargs.pop('radius1', r)
                     r2 = kwargs.pop('radius2', r)
-                    depth = kwargs.pop('depth', 2.0)
+                    depth = kwargs.pop('depth', kwargs.pop('height', kwargs.pop('length', 2.0)))
                     cap_ends = kwargs.pop('cap_ends', True)
-                    segments = kwargs.pop('segments', 32)
-                    return bmesh.ops.create_cone(
+                    segments = kwargs.pop('segments', kwargs.pop('vertices', 32))
+                    return safe_create_cone(
                         bm,
                         cap_ends=cap_ends,
                         segments=segments,
@@ -247,7 +273,7 @@ def install_compatibility_polyfills():
                     r = kwargs.pop('radius', 1.0)
                     u_segments = kwargs.pop('u_segments', kwargs.pop('segments', 32))
                     v_segments = kwargs.pop('v_segments', kwargs.pop('ring_count', 16))
-                    return bmesh.ops.create_uvsphere(
+                    return safe_create_uvsphere(
                         bm,
                         u_segments=u_segments,
                         v_segments=v_segments,
@@ -269,12 +295,36 @@ def install_compatibility_polyfills():
                         **kwargs
                     )
                 setattr(bmesh.ops, 'create_plane', bmesh_create_plane)
+
+            # 包裝 extrude_face_region：自動將 AI 常誤用的 faces= 轉換為 geom=
+            if hasattr(bmesh.ops, 'extrude_face_region'):
+                orig_extrude = bmesh.ops.extrude_face_region
+                def safe_extrude_face_region(bm, **kwargs):
+                    if 'faces' in kwargs and 'geom' not in kwargs:
+                        kwargs['geom'] = kwargs.pop('faces')
+                    return orig_extrude(bm, **kwargs)
+                setattr(bmesh.ops, 'extrude_face_region', safe_extrude_face_region)
+
+            if not hasattr(bmesh.ops, 'create_uvcapsphere'):
+                setattr(bmesh.ops, 'create_uvcapsphere', safe_create_uvsphere)
+            if not hasattr(bmesh.ops, 'create_capsule'):
+                setattr(bmesh.ops, 'create_capsule', safe_create_cone)
+
+        # 模組相容補丁：若 AI 誤寫 math.utils 轉向至 mathutils
+        if hasattr(math, '__dict__'):
+            math.utils = mathutils
     except Exception as e:
         print("[Gemini Copilot] Polyfill warning:", e)
 
 
 def sanitize_code_for_blender5(code):
     """自動修復 AI 生成代碼中常見的舊版 Blender API 語法錯誤"""
+    # 0. 修復 math.utils -> mathutils
+    code = re.sub(r'\bmath\.utils\b', 'mathutils', code)
+    # 修復 bmesh 幻覺算子
+    code = re.sub(r'\bbmesh\.ops\.create_uvcapsphere\b', 'bmesh.ops.create_uvsphere', code)
+    code = re.sub(r'\bbmesh\.ops\.create_capsule\b', 'bmesh.ops.create_cone', code)
+    code = re.sub(r'(\bbmesh\s*\.\s*ops\s*\.\s*extrude_face_region\s*\([^)]*?),\s*faces\s*=', r'\1, geom=', code)
     # 1. 修復 bpy.data.objects.new(name="...", mesh=mesh) -> object_data=mesh
     code = re.sub(
         r'(\bbpy\s*\.\s*data\s*\.\s*objects\s*\.\s*new\s*\([^)]*?),\s*mesh\s*=',
@@ -325,7 +375,11 @@ def extract_python_code(text):
                     in_code = True
                 if in_code:
                     code_lines.append(line)
-            extracted = "\n".join(code_lines).strip() if code_lines else "\n".join(lines).strip()
+            extracted = "\n".join(code_lines).strip()
+
+    # 嚴格驗證：提取的文本必須包含 Python 核心特徵 (如 bpy 或 import)，杜絕純文字對話/思考草稿混入造成語法錯誤
+    if not extracted or ("bpy" not in extracted and "import " not in extracted and "def " not in extracted):
+        return ""
 
     return sanitize_code_for_blender5(extracted)
 
@@ -370,13 +424,13 @@ class GeminiCopilotPreferences(bpy.types.AddonPreferences):
         name="模型版本",
         description="選擇要使用的 Gemini 模型",
         items=AVAILABLE_MODELS,
-        default='gemini-3.6-flash'
+        default='gemini-3.5-flash-lite'
     )
 
     custom_model: bpy.props.StringProperty(
         name="自訂模型 ID",
-        description="當模型選為自訂時生效 (例如：gemini-3.6-flash)",
-        default="gemini-3.6-flash"
+        description="當模型選為自訂時生效 (例如：gemini-3.5-flash-lite)",
+        default="gemini-3.5-flash-lite"
     )
 
     max_tokens: bpy.props.IntProperty(
@@ -434,8 +488,8 @@ class GeminiCopilotSettings(bpy.types.PropertyGroup):
 
     # 針對以文字編輯器直接運行插件時的臨時備用配置
     api_key_fallback: bpy.props.StringProperty(name="API Key (暫時)", default="", subtype='PASSWORD')
-    model_fallback: bpy.props.EnumProperty(name="模型版本 (暫時)", items=AVAILABLE_MODELS, default='gemini-3.6-flash')
-    custom_model_fallback: bpy.props.StringProperty(name="自訂模型 (暫時)", default="gemini-3.6-flash")
+    model_fallback: bpy.props.EnumProperty(name="模型版本 (暫時)", items=AVAILABLE_MODELS, default='gemini-3.5-flash-lite')
+    custom_model_fallback: bpy.props.StringProperty(name="自訂模型 (暫時)", default="gemini-3.5-flash-lite")
     max_tokens_fallback: bpy.props.IntProperty(name="Token 上限", default=8192, min=512, max=16384)
     temperature_fallback: bpy.props.FloatProperty(name="溫度", default=0.2, min=0.0, max=1.0, precision=2)
 
@@ -500,8 +554,9 @@ def execute_generated_code(code, report_func=None):
         # 推入 Undo 復原點：按下 Ctrl+Z 即可完美復原
         bpy.ops.ed.undo_push(message="Gemini Script Execution")
         
-        # 預先注入常用 Blender 模組，杜絕 NameError: name 'mathutils' is not defined
+        # 預先注入常用 Blender 模組與 __main__ 環境，杜絕 NameError 且確保 if __name__ == '__main__' 正常執行
         global_dict = {
+            "__name__": "__main__",
             "bpy": bpy,
             "math": math,
             "bmesh": bmesh,
@@ -754,7 +809,7 @@ def _async_gemini_worker(api_key, primary_model_id, max_tokens, temperature, pro
 
         try:
             req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
-            with urllib.request.urlopen(req, timeout=50) as response:
+            with urllib.request.urlopen(req, timeout=45) as response:
                 res_body = response.read().decode('utf-8')
                 res_data = json.loads(res_body)
 
@@ -780,21 +835,34 @@ def _async_gemini_worker(api_key, primary_model_id, max_tokens, temperature, pro
                 
                 if not content_parts:
                     # 若所有 parts 均為思考標籤，表示在思考階段即達上限或被中斷
+                    if attempt < len(models_to_try) - 1:
+                        next_model = models_to_try[attempt + 1]
+                        print(f"[Gemini Copilot] 模型 {current_model} 僅回傳思考過程且未產出代碼，切換至備援模型: {next_model}")
+                        time.sleep(0.5)
+                        continue
                     _request_state["result"] = {
                         "success": False,
-                        "error": "AI 推理超時或達上限，未能產出正式代碼 (請重新發送或改用 Flash-Lite 模型)"
+                        "error": "AI 推理超時或達上限，未能產出正式代碼 (建議改用 Flash-Lite 模型)"
                     }
                     return
 
                 text_response = ''.join(p.get('text', '') for p in content_parts).strip()
 
                 if not text_response:
+                    if attempt < len(models_to_try) - 1:
+                        time.sleep(0.5)
+                        continue
                     _request_state["result"] = {"success": False, "error": f"回傳資料缺少文字內容 (結束原因: {finish_reason})"}
                     return
 
                 clean_code = extract_python_code(text_response)
                 if not clean_code:
-                    _request_state["result"] = {"success": False, "error": "未能自回傳內容中解析出有效的 Python 程式碼"}
+                    if attempt < len(models_to_try) - 1:
+                        next_model = models_to_try[attempt + 1]
+                        print(f"[Gemini Copilot] 模型 {current_model} 未回傳有效代碼，切換至備援模型: {next_model}")
+                        time.sleep(0.5)
+                        continue
+                    _request_state["result"] = {"success": False, "error": "未能自回傳內容中解析出有效的 Python 程式碼 (可能因推理超出 Token 上限，建議改用 Flash-Lite 模型)"}
                     return
 
                 _request_state["result"] = {
@@ -821,7 +889,7 @@ def _async_gemini_worker(api_key, primary_model_id, max_tokens, temperature, pro
                 continue
 
             if http_err.code == 404:
-                reason = f"找不到模型 [{current_model}]。推薦改用 gemini-3.6-flash"
+                reason = f"找不到模型 [{current_model}]。推薦改用 gemini-3.5-flash-lite"
             elif http_err.code == 429:
                 reason = f"模型 [{current_model}] 請求頻率過高 (429)。請稍候 15 秒再試或切換至 gemini-3.5-flash-lite"
             elif http_err.code in (400, 401, 403):
@@ -836,6 +904,8 @@ def _async_gemini_worker(api_key, primary_model_id, max_tokens, temperature, pro
 
         except Exception as e:
             if attempt < len(models_to_try) - 1:
+                next_model = models_to_try[attempt + 1]
+                print(f"[Gemini Copilot] 模型 {current_model} 異常或超時 ({e})，自動切換至備援模型: {next_model}")
                 time.sleep(0.5)
                 continue
             _request_state["result"] = {"success": False, "error": f"網路異常: {str(e)}"}
@@ -962,7 +1032,7 @@ class OBJECT_OT_gemini_run(bpy.types.Operator):
 
 # 9. 現代化 UI 面板
 class VIEW3D_PT_gemini_copilot(bpy.types.Panel):
-    bl_label = "Gemini Copilot v2.5"
+    bl_label = "Gemini Copilot v2.6"
     bl_idname = "VIEW3D_PT_gemini_copilot"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
